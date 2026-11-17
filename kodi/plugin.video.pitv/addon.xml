@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.pitv" name="PiTV channels" version="0.1.0" provider-name="PiTV">
+	<requires>
+		<import addon="xbmc.python" version="3.0.0"/>
+		<import addon="plugin.video.youtube"/>
+	</requires>
+	<extension point="xbmc.python.pluginsource" library="main.py">
+		<provides>video</provides>
+	</extension>
+	<extension point="xbmc.addon.metadata">
+		<summary lang="en_GB">Latest videos from your favourite YouTube channels, without an API key</summary>
+		<description lang="en_GB">Reads each channel's public RSS feed and plays videos through the YouTube add-on.</description>
+		<platform>all</platform>
+	</extension>
+</addon>

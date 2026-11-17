@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""pitv-alarm — PiTV wake-up routine (runs on the Pi, started by pitv-alarm.timer).
+
+  1. wake the TV over HDMI-CEC and switch it to the Pi
+  2. full-screen "PiTV กำลังปลุกคุณ" with a countdown (tick sound each second)
+  3. chime + Kanya voice: "สวัสดีค่ะ ได้เวลาตื่นแล้วนะคะ"
+  4. "กำลังเปิดข่าวให้นะคะ" and play the newest video of the news channel
+
+OK/Back on the remote during steps 2-3 cancels the alarm.
+Usage: pitv-alarm [--count N] [--channel UC...] [--volume 0-100]
+"""
+import argparse
+import json
+import re
+import socket
+import subprocess
+import time
+import sys
+import wave
+
+sys.path.insert(0, "/usr/local/lib/pitv")
+import pitv_youtube as yt  # noqa: E402
+
+SOUNDS = "/usr/local/share/pitv/sounds"
+HDMI = "plughw:1,0"
+NEWS_CHANNEL = "UC5wKpLWxAZBZrunls3mzwEw"   # เรื่องเล่าเช้านี้ (@MorningNewsTV3)
+BACKUP_LIVE = "UCirZPTc9IoKM_DsA9aKbc4g"    # ครอบครัวข่าว 3 (@Krobkruakao3) live if the first is not live
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def kodi(method, params=None):
+    for attempt in range(30):  # Kodi may still be starting
+        try:
+            with socket.create_connection(("127.0.0.1", 9090), timeout=5) as s:
+                s.sendall(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                                      "params": params or {}}).encode())
+                return json.loads(s.recv(65536).decode()).get("result")
+        except OSError:
+            time.sleep(2)
+    raise RuntimeError("Kodi not reachable")
+
+
+def builtin(action):
+    subprocess.run(["kodi-send", f"--action={action}"], capture_output=True, timeout=10)
+
+
+def prop(key, value=""):
+    # SetProperty takes comma-separated args, so keep commas out of the value
+    builtin(f"SetProperty({key},{value.replace(',', ' ')},home)")
+
+
+def get_prop(key):
+    r = kodi("XBMC.GetInfoLabels", {"labels": [f"Window(Home).Property({key})"]}) or {}
+    return list(r.values())[0] if r else ""
+
+
+def cancelled():
+    return get_prop("pitv_alarm_closed") == "1"
+
+
+def play(name):
+    """Play a clip on the TV speakers. Kodi may hold the HDMI device for a moment,
+    so retry briefly, then fall back to letting Kodi play the clip itself."""
+    path = f"{SOUNDS}/{name}.wav"
+    for attempt in range(4):
+        r = subprocess.run(["aplay", "-q", "-D", HDMI, path], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            return
+        log(f"aplay {name} failed (try {attempt + 1}): {r.stderr.strip()[:120]}")
+        time.sleep(0.5)
+    log(f"playing {name} through Kodi instead")
+    with wave.open(path) as w:
+        seconds = w.getnframes() / w.getframerate()
+    kodi("Player.Open", {"item": {"file": path}})
+    time.sleep(seconds + 0.6)
+
+
+def _frames(name):
+    with wave.open(f"{SOUNDS}/{name}.wav") as w:
+        return w.getparams(), w.readframes(w.getnframes())
+
+
+def build_track(count, lead=1.5):
+    """Join silence + ticks + chime + hello + news into one WAV.
+
+    Returns (path, marks) where marks are (seconds, property, value) for the screen.
+    All clips are 22.05 kHz mono 16-bit (made by alarm/sounds on the Mac).
+    """
+    params, tick = _frames("tick")
+    rate, width = params.framerate, params.sampwidth
+    sec = lambda s: b"\x00" * (int(rate * s) * width)  # noqa: E731
+    out, marks, t = [sec(lead)], [], lead
+
+    for n in range(count, 0, -1):
+        marks.append((t, "count", str(n)))
+        out += [tick, sec(1.0 - len(tick) / (rate * width))]
+        t += 1.0
+    marks.append((t, "count", time.strftime("%H:%M")))
+    marks.append((t, "msg", "สวัสดีค่ะ"))
+    for name, gap in (("chime", 0.25), ("hello", 0.6)):
+        data = _frames(name)[1]
+        out += [data, sec(gap)]
+        t += len(data) / (rate * width) + gap
+    marks.append((t, "msg", "กำลังเปิดข่าวให้นะคะ"))
+    out += [_frames("news")[1], sec(0.5)]
+
+    path = "/tmp/pitv-alarm-track.wav"
+    with wave.open(path, "wb") as w:
+        w.setparams(params)
+        w.writeframes(b"".join(out))
+    return path, marks
+
+
+def start_audio(path):
+    """Start playing the track. If HDMI is busy (Kodi holds it), retry briefly."""
+    for attempt in range(6):
+        p = subprocess.Popen(["aplay", "-q", "-D", HDMI, path], stderr=subprocess.PIPE, text=True)
+        time.sleep(0.3)
+        if p.poll() is None or p.returncode == 0:
+            return p
+        log(f"aplay failed (try {attempt + 1}): {p.stderr.read().strip()[:120]}")
+        time.sleep(0.5)
+    log("HDMI busy; playing the alarm track through Kodi")
+    with wave.open(path) as w:
+        seconds = w.getnframes() / w.getframerate()
+    kodi("Player.Open", {"item": {"file": path}})
+    return subprocess.Popen(["sleep", f"{seconds + 0.5:.1f}"])  # stand-in to wait on
+
+
+def cec(*args):
+    return subprocess.run(["cec-ctl", "-d", "/dev/cec0", *args], capture_output=True, text=True, timeout=10)
+
+
+def pi_phys_addr():
+    m = re.search(r"Physical Address\s*:\s*([0-9a-f.]{7})", cec().stdout)
+    return m.group(1) if m else "1.0.0.0"
+
+
+def tv_power():
+    m = re.search(r"pwr-state:\s*([a-z-]+)", cec("--to", "0", "--give-device-power-status").stdout)
+    return m.group(1) if m else "unknown"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--count", type=int, default=10)
+    ap.add_argument("--channel", default=NEWS_CHANNEL)
+    ap.add_argument("--backup", default=BACKUP_LIVE, help="channel whose live stream is used if --channel is not live")
+    ap.add_argument("--volume", type=int, default=80)
+    # 0 = start the countdown right after waking the TV (user's choice). The first
+    # seconds of audio can be lost while the TV powers up; try --warmup 10 if so.
+    ap.add_argument("--warmup", type=int, default=0, help="seconds to wait after waking the TV")
+    ap.add_argument("--lead", type=float, default=1.5, help="seconds of silence at the start of the track")
+    a = ap.parse_args()
+
+    was_on = tv_power() == "on"
+    log(f"waking TV (was {'on' if was_on else 'off/standby'})")
+    cec("--to", "0", "--image-view-on")
+    cec("--to", "15", "--active-source", f"phys-addr={pi_phys_addr()}")
+    if not was_on and a.warmup > 0:
+        # The TV needs a while after power-on before its speakers play HDMI audio;
+        # anything played earlier is lost. Wait for "on", then let audio settle.
+        for _ in range(20):
+            if tv_power() == "on":
+                break
+            time.sleep(1)
+        log(f"TV is {tv_power()}; waiting {a.warmup}s for its audio")
+        cec("--to", "15", "--active-source", f"phys-addr={pi_phys_addr()}")
+        time.sleep(a.warmup)
+    kodi("JSONRPC.Ping")
+    kodi("Application.SetMute", {"mute": False})
+    kodi("Application.SetVolume", {"volume": max(0, min(a.volume, 100))})
+    players = kodi("Player.GetActivePlayers") or []
+    for p in players:
+        kodi("Player.Stop", {"playerid": p["playerid"]})
+
+    # Look up the news first so nothing waits on the network once the voice starts.
+    # 1) live on the main channel  2) live on the backup channel  3) newest upload of the main one
+    vid = None
+    for label, fn, ch in (("LIVE", yt.live_video, a.channel),
+                          ("backup LIVE", yt.live_video, a.backup),
+                          ("newest", yt.newest_video, a.channel)):
+        try:
+            found = fn(ch)
+        except Exception as e:  # noqa: BLE001
+            log(f"{label} {ch}: {e}")
+            continue
+        if found:
+            log(f"news {label}: {found[0]} {found[1]}")
+            vid = found[0]
+            break
+        log(f"news {label} {ch}: nothing")
+
+    # One continuous audio stream: TVs drop the first part of every new HDMI audio
+    # stream, so separate clips (tick, tick, ..., hello) each lose their start.
+    track, marks = build_track(a.count, lead=a.lead)
+
+    prop("pitv_alarm_closed", "")
+    prop("pitv_alarm_title", "PiTV กำลังปลุกคุณ")
+    prop("pitv_alarm_msg", "อีกนิดเดียว...")
+    prop("pitv_alarm_count", str(a.count))
+    builtin("ActivateWindow(1150)")
+
+    player = start_audio(track)
+    t0 = time.monotonic()
+    for at, kind, value in marks:          # move the screen along with the audio
+        while time.monotonic() - t0 < at:
+            if cancelled():
+                player.terminate()
+                log("cancelled")
+                return
+            time.sleep(0.05)
+        prop(f"pitv_alarm_{kind}", value)
+    player.wait(timeout=60)
+
+    builtin("ReplaceWindow(home)")
+    if vid:
+        kodi("Player.Open", {"item": {"file": f"plugin://plugin.video.youtube/play/?video_id={vid}"}})
+    else:
+        kodi("GUI.ShowNotification", {"title": "PiTV", "message": "โหลดข่าวไม่ได้ เช็กอินเทอร์เน็ตนะคะ",
+                                       "displaytime": 15000})
+    prop("pitv_alarm_closed", "")
+    log("done")
+
+
+if __name__ == "__main__":
+    main()

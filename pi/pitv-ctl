@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""pitv-ctl — PiTV controller that runs ON the Pi.
+
+Reads one JSON command on stdin, prints one JSON result on stdout:
+    echo '{"cmd": "notify", "title": "Hi", "message": "Dinner"}' | pitv-ctl
+
+The MCP server on the Mac calls this over SSH. Arguments always travel as
+JSON on stdin and are passed to subprocesses as argv lists, never through a
+shell, so text from the AI cannot inject shell commands.
+"""
+import base64
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+KODI = ("127.0.0.1", 9090)
+CEC_DEV = "/dev/cec0"
+HDMI_ALSA = "plughw:1,0"        # vc4-hdmi
+TTS_VOICES = {"th": "th", "en": "en-us"}
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,63}$", re.I)
+
+
+class PiTVError(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ helpers
+def run(argv, timeout=20, input_text=None):
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input_text)
+    return p.returncode, p.stdout, p.stderr
+
+
+def kodi(method, params=None):
+    """One Kodi JSON-RPC call over the local TCP socket."""
+    req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    try:
+        with socket.create_connection(KODI, timeout=5) as s:
+            s.sendall(json.dumps(req).encode())
+            buf = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                try:
+                    resp = json.loads(buf.decode())
+                    break
+                except ValueError:
+                    continue
+    except OSError as e:
+        raise PiTVError(f"Kodi is not reachable on {KODI[0]}:{KODI[1]} ({e}). Is kodi.service running?")
+    if "error" in resp:
+        raise PiTVError(f"Kodi error: {resp['error']}")
+    return resp.get("result")
+
+
+def cec(*args, timeout=10):
+    rc, out, err = run(["cec-ctl", "-d", CEC_DEV, *args], timeout=timeout)
+    return rc, out + err
+
+
+def pi_phys_addr():
+    """The Pi's HDMI-CEC physical address, e.g. 1.0.0.0 when it is on the TV's HDMI 1."""
+    rc, out = cec()
+    m = re.search(r"Physical Address\s*:\s*([0-9a-f]\.[0-9a-f]\.[0-9a-f]\.[0-9a-f])", out)
+    return m.group(1) if m else "1.0.0.0"
+
+
+def tv_power_state():
+    rc, out = cec("--to", "0", "--give-device-power-status")
+    m = re.search(r"pwr-state:\s*([a-z\-]+)", out)
+    if m:
+        return m.group(1)
+    if "Timeout" in out or "NACK" in out.upper():
+        return "no-answer (TV fully off or CEC disabled)"
+    return "unknown"
+
+
+def active_player():
+    players = kodi("Player.GetActivePlayers") or []
+    return players[0]["playerid"] if players else None
+
+
+# ------------------------------------------------------------------ commands
+def cmd_status(_):
+    result = {"tv_power": tv_power_state()}
+    try:
+        app = kodi("Application.GetProperties", {"properties": ["volume", "muted", "version"]})
+        result["kodi"] = {
+            "running": True,
+            "version": f"{app['version']['major']}.{app['version']['minor']}",
+            "volume": app["volume"],
+            "muted": app["muted"],
+        }
+        pid = active_player()
+        if pid is not None:
+            item = kodi("Player.GetItem", {"playerid": pid, "properties": ["title", "file"]})["item"]
+            props = kodi("Player.GetProperties", {"playerid": pid, "properties": ["speed", "time", "totaltime"]})
+            result["kodi"]["playing"] = {
+                "title": item.get("title") or item.get("label"),
+                "file": item.get("file"),
+                "paused": props["speed"] == 0,
+                "time": props["time"],
+                "totaltime": props["totaltime"],
+            }
+        else:
+            result["kodi"]["playing"] = None
+    except PiTVError as e:
+        result["kodi"] = {"running": False, "error": str(e)}
+    rc, out, _ = run(["sudo", "-n", "pihole", "status"], timeout=10)
+    result["pihole"] = "blocking enabled" if "enabled" in out.lower() else out.strip()[-200:]
+    return result
+
+
+def cmd_power(a):
+    state = a.get("state")
+    if state == "on":
+        cec("--to", "0", "--image-view-on")
+        cec("--to", "15", "--active-source", f"phys-addr={pi_phys_addr()}")
+    elif state == "off":
+        cec("--to", "0", "--standby")
+    else:
+        raise PiTVError("state must be 'on' or 'off'")
+    time.sleep(2)
+    return {"requested": state, "tv_power": tv_power_state()}
+
+
+def cmd_input_pi(_):
+    cec("--to", "0", "--image-view-on")
+    cec("--to", "15", "--active-source", f"phys-addr={pi_phys_addr()}")
+    return {"ok": True, "note": "Asked the TV to switch to the Pi's HDMI input."}
+
+
+def cmd_notify(a):
+    title = str(a.get("title") or "PiTV")[:80]
+    message = str(a.get("message") or "")[:300]
+    if not message:
+        raise PiTVError("message is required")
+    seconds = max(2, min(int(a.get("seconds", 8)), 60))
+    kodi("GUI.ShowNotification", {"title": title, "message": message, "displaytime": seconds * 1000})
+    return {"ok": True}
+
+
+def cmd_say(a):
+    text = str(a.get("text") or "").strip()[:1000]
+    if not text:
+        raise PiTVError("text is required")
+    lang = a.get("lang", "en")
+    voice = TTS_VOICES.get(lang)
+    if not voice:
+        raise PiTVError(f"lang must be one of {sorted(TTS_VOICES)}")
+    speed = max(80, min(int(a.get("speed", 140)), 260))
+    fd, wav = tempfile.mkstemp(prefix="pitv-say-", suffix=".wav")
+    os.close(fd)
+    rc, _, err = run(["espeak-ng", "-v", voice, "-s", str(speed), "-w", wav, "--stdin"], input_text=text)
+    if rc != 0:
+        os.remove(wav)
+        raise PiTVError(f"espeak-ng failed: {err.strip()}")
+    return play_wav_file(wav)
+
+
+def play_wav_file(wav):
+    """Play a WAV on the TV speakers, then delete it (unless Kodi still needs it)."""
+    keep = False
+    try:
+        rc, _, err = run(["aplay", "-q", "-D", HDMI_ALSA, wav], timeout=180)
+        if rc != 0:
+            # HDMI device busy (e.g. Kodi holds it) -> let Kodi play the clip
+            os.chmod(wav, 0o644)
+            kodi("Player.Open", {"item": {"file": wav}})
+            keep = True  # /tmp is cleared on reboot
+            return {"ok": True, "via": "kodi", "note": "HDMI audio was busy; played through Kodi (stops current playback)."}
+        return {"ok": True, "via": "hdmi"}
+    finally:
+        if not keep and os.path.exists(wav):
+            os.remove(wav)
+
+
+MAX_WAV_BYTES = 8 * 1024 * 1024
+
+
+def cmd_play_wav(a):
+    """Play a WAV made elsewhere (e.g. macOS `say`), sent base64-encoded."""
+    try:
+        data = base64.b64decode(a.get("wav_b64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise PiTVError("wav_b64 is not valid base64")
+    if len(data) > MAX_WAV_BYTES:
+        raise PiTVError("audio too long (max 8 MB)")
+    if not (data[:4] == b"RIFF" and data[8:12] == b"WAVE"):
+        raise PiTVError("not a WAV file")
+    fd, wav = tempfile.mkstemp(prefix="pitv-wav-", suffix=".wav")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return play_wav_file(wav)
+
+
+def cmd_play(a):
+    url = str(a.get("url") or "").strip()
+    if not re.match(r"^(https?|plugin|smb|nfs)://", url):
+        raise PiTVError("url must start with http(s)://, plugin://, smb:// or nfs://")
+    kodi("Player.Open", {"item": {"file": url}})
+    return {"ok": True, "playing": url}
+
+
+def cmd_youtube_live(a):
+    """Play a channel's live stream; if it is not live, optionally its newest video."""
+    sys.path.insert(0, "/usr/local/lib/pitv")
+    import pitv_youtube as yt
+
+    channel = str(a.get("channel") or "")
+    try:
+        live = yt.live_video(channel)
+        if live:
+            kodi("Player.Open", {"item": {"file": yt.play_url(live[0])}})
+            return {"ok": True, "live": True, "video_id": live[0], "title": live[1]}
+        if a.get("fallback_newest", True):
+            newest = yt.newest_video(channel)
+            if newest:
+                kodi("Player.Open", {"item": {"file": yt.play_url(newest[0])}})
+                return {"ok": True, "live": False, "video_id": newest[0], "title": newest[1],
+                        "note": "channel is not live; playing its newest video"}
+        return {"ok": True, "live": False, "note": "channel is not live right now"}
+    except ValueError as e:
+        raise PiTVError(str(e))
+    except OSError as e:
+        raise PiTVError(f"could not reach YouTube: {e}")
+
+
+def cmd_control(a):
+    action = a.get("action")
+    pid = active_player()
+    if action in ("play_pause", "stop", "next", "previous") and pid is None:
+        raise PiTVError("nothing is playing")
+    if action == "play_pause":
+        r = kodi("Player.PlayPause", {"playerid": pid})
+        return {"ok": True, "paused": r.get("speed") == 0}
+    if action == "stop":
+        kodi("Player.Stop", {"playerid": pid})
+        return {"ok": True}
+    if action in ("next", "previous"):
+        kodi("Player.GoTo", {"playerid": pid, "to": action})
+        return {"ok": True}
+    if action == "mute":
+        return {"ok": True, "muted": kodi("Application.SetMute", {"mute": "toggle"})}
+    if action == "volume":
+        level = max(0, min(int(a.get("level", 50)), 100))
+        return {"ok": True, "volume": kodi("Application.SetVolume", {"volume": level})}
+    if action == "home":
+        kodi("GUI.ActivateWindow", {"window": "home"})
+        return {"ok": True}
+    raise PiTVError("action must be one of play_pause, stop, next, previous, mute, volume, home")
+
+
+def cmd_pihole_stats(_):
+    rc, out, err = run(["sudo", "-n", "pihole", "api", "stats/summary"], timeout=15)
+    try:
+        s = json.loads(out)
+    except ValueError:
+        raise PiTVError(f"pihole api failed: {(err or out).strip()[:300]}")
+    q = s.get("queries", {})
+    rc2, out2, _ = run(["sudo", "-n", "pihole", "api", "stats/top_domains?blocked=true&count=10"], timeout=15)
+    try:
+        top = [d["domain"] + f" ({d['count']})" for d in json.loads(out2).get("domains", [])]
+    except (ValueError, KeyError):
+        top = []
+    return {
+        "queries_total": q.get("total"),
+        "blocked": q.get("blocked"),
+        "percent_blocked": round(q.get("percent_blocked") or 0, 1),
+        "clients": s.get("clients", {}).get("active"),
+        "domains_on_blocklist": s.get("gravity", {}).get("domains_being_blocked"),
+        "top_blocked": top,
+    }
+
+
+def _domain(a):
+    d = str(a.get("domain") or "").strip().lower()
+    if not DOMAIN_RE.match(d):
+        raise PiTVError("domain must look like example.com")
+    return d
+
+
+def cmd_pihole_block(a):
+    d = _domain(a)
+    rc, out, err = run(["sudo", "-n", "pihole", "deny", d], timeout=30)
+    return {"ok": rc == 0, "domain": d, "output": (out + err).strip()[-300:]}
+
+
+def cmd_pihole_unblock(a):
+    d = _domain(a)
+    rc, out, err = run(["sudo", "-n", "pihole", "deny", "remove", d], timeout=30)
+    rc2, out2, err2 = run(["sudo", "-n", "pihole", "allow", d], timeout=30)
+    return {"ok": rc2 == 0, "domain": d, "output": (out + err + out2 + err2).strip()[-300:]}
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "power": cmd_power,
+    "input_pi": cmd_input_pi,
+    "notify": cmd_notify,
+    "say": cmd_say,
+    "play_wav": cmd_play_wav,
+    "play": cmd_play,
+    "youtube_live": cmd_youtube_live,
+    "control": cmd_control,
+    "pihole_stats": cmd_pihole_stats,
+    "pihole_block": cmd_pihole_block,
+    "pihole_unblock": cmd_pihole_unblock,
+}
+
+
+def main():
+    try:
+        args = json.loads(sys.stdin.read() or "{}")
+        fn = COMMANDS.get(args.get("cmd"))
+        if fn is None:
+            raise PiTVError(f"unknown cmd; use one of {sorted(COMMANDS)}")
+        out = {"ok": True, "result": fn(args)}
+    except PiTVError as e:
+        out = {"ok": False, "error": str(e)}
+    except Exception as e:  # noqa: BLE001 - report anything back to the caller
+        out = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(out, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

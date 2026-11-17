@@ -1,0 +1,23 @@
+#cloud-config
+# PiTV first-boot config for Raspberry Pi OS Lite (Trixie). boot/prepare-sd.sh fills in
+# __HOSTNAME__, __TIMEZONE__ and __SSH_KEY__ and copies this onto the SD card.
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+timezone: __TIMEZONE__
+locale: en_US.UTF-8
+
+users:
+  - name: pi
+    gecos: PiTV
+    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    # No password on purpose: SSH key login only. Set one later yourself: sudo passwd pi
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_KEY__
+
+ssh_pwauth: false
+
+runcmd:
+  - [systemctl, enable, --now, ssh]
